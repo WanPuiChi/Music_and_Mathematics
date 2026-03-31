@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>水瓶琴音高探測器 (進階抗噪 + 音名停留版)</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #e8f5e9;
+            color: #333;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+            text-align: center;
+            position: relative; /* 讓浮水印有定位基準 */
+        }
+        .container {
+            background: white;
+            padding: 40px;
+            border-radius: 20px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+            max-width: 500px;
+            width: 90%;
+            z-index: 10;
+        }
+        h1 { color: #2e7d32; margin-top: 0; }
+        .note-display {
+            font-size: 6rem;
+            font-weight: bold;
+            color: #1565c0;
+            margin: 20px 0;
+            min-height: 140px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: #f0f4f8;
+            border-radius: 15px;
+            transition: background 0.3s ease-out; /* 讓綠色背景退得慢一點，視覺更舒服 */
+        }
+        /* 當收到聲音時，背景變成明顯的淺綠色 */
+        .note-display.active { background: #a5d6a7; transition: background 0.05s; } 
+        .hz-display { font-size: 2rem; color: #d32f2f; font-weight: bold; margin-bottom: 20px; }
+        .solfege { font-size: 1.5rem; color: #666; margin-top: -10px; }
+        button {
+            background-color: #d84315; color: white; border: none; padding: 15px 30px;
+            font-size: 1.2em; font-weight: bold; border-radius: 8px; cursor: pointer;
+            transition: background 0.3s; margin-bottom: 15px;
+        }
+        button:hover { background-color: #bf360c; }
+        .status { font-size: 0.9em; color: #757575; }
+        
+        /* 雜音過濾控制區 */
+        .filter-control {
+            background: #fff3e0;
+            padding: 15px;
+            border-radius: 10px;
+            margin: 20px 0;
+            text-align: left;
+            border: 1px dashed #ffb74d;
+        }
+        .filter-control label { font-weight: bold; color: #e65100; font-size: 0.9em;}
+        input[type="range"] { width: 100%; cursor: pointer; margin-top: 10px; }
+        
+        .volume-meter { width: 100%; height: 10px; background: #e0e0e0; border-radius: 5px; margin-top: 20px; overflow: hidden; }
+        .volume-bar { height: 100%; width: 0%; background: #4caf50; transition: width 0.1s; }
+
+        /* 專屬浮水印設計 */
+        .watermark {
+            position: fixed;
+            bottom: 15px;
+            right: 20px;
+            font-size: 0.9rem;
+            font-weight: bold;
+            color: rgba(0, 0, 0, 0.25); /* 半透明灰色 */
+            pointer-events: none; /* 防止滑鼠誤觸干擾操作 */
+            z-index: 999;
+            letter-spacing: 1px;
+        }
+    </style>
+</head>
+<body>
+
+<div class="watermark">created by Wan Pui Chi</div>
+
+<div class="container">
+    <h1>🎧 音高探測器</h1>
+    <p>敲擊你的水瓶，看看它是什麼音！</p>
+    
+    <button id="start-btn">🎙️ 允許開啟麥克風</button>
+    <div class="status" id="status-text">點擊上方按鈕開始</div>
+
+    <div class="filter-control">
+        <label for="noise-gate">🎚️ 雜音過濾強度 (Noise Filter): <span id="gate-val">0.05</span></label>
+        <input type="range" id="noise-gate" min="0.01" max="0.15" step="0.01" value="0.05">
+        <div class="status" style="margin-top: 5px;">數值越高，麥克風越遲鈍，只會捕捉大聲的「敲擊聲」，忽略背景聊天雜音。</div>
+    </div>
+
+    <div class="note-display" id="note-box">
+        <span id="note">--</span>
+    </div>
+    <div class="solfege" id="solfege">等待敲擊...</div>
+    <div class="hz-display"><span id="pitch">0</span> Hz</div>
+
+    <div class="volume-meter">
+        <div class="volume-bar" id="volume-bar"></div>
+    </div>
+</div>
+
+<script>
+    const startBtn = document.getElementById('start-btn');
+    const statusText = document.getElementById('status-text');
+    const noteElem = document.getElementById('note');
+    const pitchElem = document.getElementById('pitch');
+    const solfegeElem = document.getElementById('solfege');
+    const volumeBar = document.getElementById('volume-bar');
+    const noteBox = document.getElementById('note-box');
+    
+    const noiseGateSlider = document.getElementById('noise-gate');
+    const gateValDisplay = document.getElementById('gate-val');
+
+    noiseGateSlider.addEventListener('input', () => {
+        gateValDisplay.innerText = noiseGateSlider.value;
+    });
+
+    let audioContext;
+    let analyser;
+    let microphone;
+    let isListening = false;
+
+    const noteStrings = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+    const solfegeStrings = ["Do", "", "Re", "", "Mi", "Fa", "", "Sol", "", "La", "", "Si"];
+
+    function noteFromPitch(frequency) {
+        const noteNum = 12 * (Math.log(frequency / 440) / Math.log(2));
+        return Math.round(noteNum) + 69;
+    }
+
+    function autoCorrelate(buf, sampleRate) {
+        let SIZE = buf.length;
+        let rms = 0;
+
+        for (let i = 0; i < SIZE; i++) {
+            let val = buf[i];
+            rms += val * val;
+        }
+        rms = Math.sqrt(rms / SIZE);
+        
+        volumeBar.style.width = Math.min(100, rms * 1000) + '%';
+
+        const threshold = parseFloat(noiseGateSlider.value);
+        if (rms < threshold) return -1;
+
+        let r1 = 0, r2 = SIZE - 1, thres = 0.2;
+        for (let i = 0; i < SIZE / 2; i++)
+            if (Math.abs(buf[i]) < thres) { r1 = i; break; }
+        for (let i = 1; i < SIZE / 2; i++)
+            if (Math.abs(buf[SIZE - i]) < thres) { r2 = SIZE - i; break; }
+
+        buf = buf.slice(r1, r2);
+        SIZE = buf.length;
+
+        let c = new Array(SIZE).fill(0);
+        for (let i = 0; i < SIZE; i++)
+            for (let j = 0; j < SIZE - i; j++)
+                c[i] = c[i] + buf[j] * buf[j + i];
+
+        let d = 0; while (c[d] > c[d + 1]) d++;
+        let maxval = -1, maxpos = -1;
+        for (let i = d; i < SIZE; i++) {
+            if (c[i] > maxval) {
+                maxval = c[i];
+                maxpos = i;
+            }
+        }
+        let T0 = maxpos;
+        return sampleRate / T0;
+    }
+
+    async function startListening() {
+        if (isListening) return;
+
+        try {
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            analyser = audioContext.createAnalyser();
+            analyser.fftSize = 2048;
+
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            microphone = audioContext.createMediaStreamSource(stream);
+            microphone.connect(analyser);
+            
+            isListening = true;
+            startBtn.style.display = 'none';
+            statusText.innerText = '🟢 麥克風運作中...';
+            
+            updatePitch();
+        } catch (err) {
+            alert('無法存取麥克風。請確保您使用 HTTPS 連線。');
+            console.error(err);
+        }
+    }
+
+    let buffer = new Float32Array(2048);
+    function updatePitch() {
+        analyser.getFloatTimeDomainData(buffer);
+        let ac = autoCorrelate(buffer, audioContext.sampleRate);
+
+        if (ac == -1) {
+            // 【關鍵修改】：不再清空文字，只移除 active 類別讓綠色背景退去
+            // 這樣前一次敲擊的音名就會留在畫面上供學生抄寫
+            noteBox.classList.remove('active');
+        } else {
+            let pitch = ac;
+            pitchElem.innerText = Math.round(pitch);
+            let note = noteFromPitch(pitch);
+            
+            let noteName = noteStrings[note % 12];
+            let octave = Math.floor(note / 12) - 1;
+            noteElem.innerText = noteName + octave;
+
+            let solfegeName = solfegeStrings[note % 12];
+            if (solfegeName !== "") {
+                solfegeElem.innerText = `( 唱名：${solfegeName} )`;
+            } else {
+                solfegeElem.innerText = `( 半音 )`;
+            }
+            // 收到新聲音時，背景變成綠色閃爍
+            noteBox.classList.add('active');
+        }
+
+        if (!window.requestAnimationFrame)
+            window.requestAnimationFrame = window.webkitRequestAnimationFrame;
+        window.requestAnimationFrame(updatePitch);
+    }
+
+    startBtn.addEventListener('click', startListening);
+</script>
+
+</body>
+</html>
